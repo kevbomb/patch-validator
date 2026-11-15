@@ -1,0 +1,6 @@
+*.snapshot.json
+*.report.json
+patch-baseline.json
+patch-report.json
+TestResults.xml
+preview*.png
