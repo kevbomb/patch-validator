@@ -6,7 +6,7 @@ Describe 'Remote authentication' {
         $global:PatchValidatorRemoteTest_Credential = New-Object Management.Automation.PSCredential('EXAMPLE\test-user',$password)
         $global:PatchValidatorRemoteTest_Arguments = $null
         Mock Invoke-Command -ModuleName PatchValidator {
-            param($ComputerName,$ScriptBlock,$ArgumentList,$SessionOption,$Credential,$UseSSL)
+            param($ComputerName,$ScriptBlock,$ArgumentList,$SessionOption,$Credential,$UseSSL,$Authentication,$ConfigurationName,$Session)
             $global:PatchValidatorRemoteTest_Arguments = $PSBoundParameters
             [pscustomobject]@{ServiceName='Fixture';State='Running'}
         }
@@ -69,5 +69,59 @@ Describe 'Remote authentication' {
         catch { $didThrow = $_.Exception.Message -eq 'Test authentication failure' }
         $didThrow | Should Be $true
         Assert-MockCalled Invoke-Command -ModuleName PatchValidator -Times 1 -Exactly -Scope It
+    }
+    It 'explicitly requires Kerberos over HTTP for a domain FQDN' {
+        Get-PatchSnapshot Fixture -ComputerName server.example.invalid -Authentication Kerberos | Out-Null
+        $global:PatchValidatorRemoteTest_Arguments.Authentication | Should Be Kerberos
+        $global:PatchValidatorRemoteTest_Arguments.ContainsKey('UseSSL') | Should Be $false
+        $global:PatchValidatorRemoteTest_Arguments.ContainsKey('Credential') | Should Be $false
+    }
+    It 'never falls back to NTLM after an explicit Kerberos failure' {
+        Mock Invoke-Command -ModuleName PatchValidator { throw 'Kerberos SPN failure' }
+        $didThrow = $false
+        try { Get-PatchSnapshot Fixture -ComputerName server.example.invalid -Authentication Kerberos | Out-Null } catch { $didThrow = $true }
+        $didThrow | Should Be $true
+        Assert-MockCalled Invoke-Command -ModuleName PatchValidator -Times 1 -Exactly -Scope It -ParameterFilter { $Authentication -eq 'Kerberos' }
+        Assert-MockCalled Invoke-Command -ModuleName PatchValidator -Times 1 -Exactly -Scope It
+    }
+    It 'rejects an IP target when Kerberos is required before connecting' {
+        $didThrow = $false
+        try { Get-PatchSnapshot Fixture -ComputerName 192.0.2.25 -Authentication Kerberos -Credential $global:PatchValidatorRemoteTest_Credential | Out-Null } catch { $didThrow = $_.Exception.Message -like '*Kerberos requires*' }
+        $didThrow | Should Be $true
+        Assert-MockCalled Invoke-Command -ModuleName PatchValidator -Times 0 -Exactly -Scope It
+    }
+    It 'requires HTTPS for explicit Negotiate and retains certificate checks' {
+        $didThrow = $false
+        try { Get-PatchSnapshot Fixture -ComputerName server.example.invalid -Authentication Negotiate | Out-Null } catch { $didThrow = $true }
+        $didThrow | Should Be $true
+        Get-PatchSnapshot Fixture -ComputerName server.example.invalid -Authentication Negotiate -UseSSL | Out-Null
+        $arguments = $global:PatchValidatorRemoteTest_Arguments
+        $arguments.Authentication | Should Be Negotiate
+        [bool]$arguments.UseSSL | Should Be $true
+        $arguments.SessionOption.SkipCACheck | Should Be $false
+        $arguments.SessionOption.SkipCNCheck | Should Be $false
+        $arguments.SessionOption.SkipRevocationCheck | Should Be $false
+        $arguments.ContainsKey('AllowRedirection') | Should Be $false
+        Assert-MockCalled Invoke-Command -ModuleName PatchValidator -Times 1 -Exactly -Scope It
+    }
+    It 'does not retry a certificate failure over HTTP' {
+        Mock Invoke-Command -ModuleName PatchValidator { throw 'SSL certificate name mismatch' }
+        $didThrow = $false
+        try { Get-PatchSnapshot Fixture -ComputerName server.example.invalid -Authentication Negotiate -UseSSL | Out-Null } catch { $didThrow = $true }
+        $didThrow | Should Be $true
+        Assert-MockCalled Invoke-Command -ModuleName PatchValidator -Times 1 -Exactly -Scope It -ParameterFilter { $UseSSL }
+    }
+    It 'passes a configured endpoint and optional signature check as data' {
+        Get-PatchSnapshot Fixture -ComputerName server.example.invalid -Authentication Kerberos -ConfigurationName ApprovedFullLanguage -CheckAuthenticode | Out-Null
+        $global:PatchValidatorRemoteTest_Arguments.ConfigurationName | Should Be ApprovedFullLanguage
+        $global:PatchValidatorRemoteTest_Arguments.ArgumentList[2] | Should Be $true
+    }
+    It 'uses an existing authorized session without reconnecting or changing its authentication' {
+        # Uninitialized typed fixture: this tests dispatch only, not a live JEA/WinRM session.
+        $session = [Runtime.Serialization.FormatterServices]::GetUninitializedObject([Management.Automation.Runspaces.PSSession])
+        Get-PatchSnapshot Fixture -Session $session | Out-Null
+        [object]::ReferenceEquals($session,$global:PatchValidatorRemoteTest_Arguments.Session[0]) | Should Be $true
+        $global:PatchValidatorRemoteTest_Arguments.ContainsKey('ComputerName') | Should Be $false
+        $global:PatchValidatorRemoteTest_Arguments.ContainsKey('Authentication') | Should Be $false
     }
 }

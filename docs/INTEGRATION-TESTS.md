@@ -1,0 +1,21 @@
+# Authorized infrastructure validation
+
+Local Pester tests check dispatch options and simulated failures; they do not prove Kerberos negotiation, TLS validation, certificate revocation, account privilege or JEA restrictions on your servers. Use dedicated test hosts and approved accounts. Do not change production authentication policy to run negative tests.
+
+| Area | Test and expected observation |
+| --- | --- |
+| Kerberos HTTP | From the jump server use an FQDN, `-Authentication Kerberos`, and HTTP. Capture succeeds with the approved account. Verify Kerberos in target/domain security telemetry and ticket state; do not infer it solely from successful collection. |
+| No fallback | In an isolated test, use a name without the required SPN or an unavailable domain trust. Explicit Kerberos must fail once. Verify no NTLM logon/alternate-account retry. An IP target is rejected locally. |
+| HTTPS | Use an approved non-Kerberos account with Negotiate/UseSSL. Test a valid listener, then isolated listeners with name mismatch, untrusted chain, expiry, and revoked certificate as supported by enterprise revocation policy. Invalid identity must fail without HTTP retry. Validate behavior with your revocation/network availability policy; no SkipCA/CN/Revocation flags are set by the app. |
+| Jump host | Verify outbound collection without enabling inbound WinRM on the GUI host. Target listener/ACL permissions still apply. |
+| Existing sessions | Create a real authorized PSSession and collect via `-Session`. Confirm the original identity, endpoint and transport are retained and the session remains usable afterward. |
+| Least privilege | Run against EXE and shared-host DLL services with the delegated account. Confirm read-only rights and no service/registry/file mutations. Missing process/registry/file access must cause Review or explicit collection failure, never a confident Pass. |
+| JEA | Deploy a reviewed wrapper in a lab; verify allowlisted service success and denial of arbitrary commands, expressions, paths, unauthorized services/accounts and modification of the module. Test the actual endpoint identity's effective permissions. |
+| Authenticode | Collect approved signed, unsigned, untrusted and deliberately signature-corrupted test files. Verify Status and signer metadata against Windows tools. Test a correctly timestamped signature whose signer is now expired. Verify exact publisher mismatch Fail; unsigned/internal applications Review. Use disposable copies and no live service modification. |
+| Evidence keys | Enroll an approved non-exportable store certificate. Test accessible key success; inaccessible/missing/expired key failure with no partial output. Ensure operators without key rights cannot sign. Test verification on a different authorized audit host. |
+| Evidence trust | Independently configure pins. Verify signed round-trip, corrupted CMS/payload rejection, attacker-signed file Review/rejection, absent pin Review/rejection, and removal of a compromised pin. Test expired signer and the documented lack of timestamp-based historical validation. |
+| ACLs / retention | Confirm unauthorized users cannot replace code/pins, read private keys, edit evidence, or access protected metadata. Confirm auditor read-only access, secure temporary-file inheritance and retention/rollback controls. |
+| GUI / credentials | Exercise actual credential prompt, cancellation, wrong password, Clear, host change, New comparison and normal X close, including active-capture handling. Check exported files and approved logs for test secrets. Test DPI/layout on supported displays. Never use real secrets in test assertions. |
+| Before/after | Use an authorized disposable service update. Same server/service/component, matching target, reliable metadata and required restart/signatures should Pass. Mismatched identities, unchanged hash with conflicting versions and missing evidence must not Pass. Do not interpret this as a CVE test. |
+
+Record OS/PowerShell versions, target configuration, selected auth policy, certificate identities, account roles, test outcome and sanitized diagnostics. Keep sensitive test evidence in the approved evidence store. Release approval should explicitly distinguish executed checks from deferred ones.

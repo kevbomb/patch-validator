@@ -26,7 +26,11 @@ Describe 'Service component discovery' {
             }
             return $global:PatchValidatorTest_collectorService
         }
-        Mock Get-ItemProperty { [pscustomobject]@{ServiceDll=$global:PatchValidatorTest_fixtureDll} }
+        Mock Get-ItemProperty {
+            param($Name)
+            if ($Name -eq 'MachineGuid') { return [pscustomobject]@{MachineGuid='11111111-1111-1111-1111-111111111111'} }
+            [pscustomobject]@{ServiceDll=$global:PatchValidatorTest_fixtureDll}
+        }
     }
 
     It 'automatically reads metadata from a quoted executable without launching it' {
@@ -98,5 +102,34 @@ Describe 'Service component discovery' {
         $snapshot = & $collectorScript -ServiceName Fixture
         $snapshot.SelectionReliable | Should Be $false
         ($snapshot.Notes -join ' ') | Should Match 'unquoted spaces'
+    }
+    It 'does not request Authenticode checks when the option is disabled' {
+        Mock Get-AuthenticodeSignature { throw 'Unexpected signature request' }
+        (& $collectorScript -ServiceName Fixture).Authenticode.Status | Should Be NotChecked
+        Assert-MockCalled Get-AuthenticodeSignature -Times 0 -Exactly -Scope It
+    }
+    It 'records unsigned and invalid signatures without changing the file or service' {
+        Mock Get-AuthenticodeSignature { [pscustomobject]@{Status='NotSigned';SignerCertificate=$null;TimeStamperCertificate=$null} }
+        $snapshot = & $collectorScript -ServiceName Fixture -CheckAuthenticode
+        $snapshot.Authenticode.Status | Should Be NotSigned
+        $snapshot.FileSha256.Length | Should Be 64
+        $snapshot.SelectionReliable | Should Be $true
+        Mock Get-AuthenticodeSignature { [pscustomobject]@{Status='HashMismatch';SignerCertificate=$null;TimeStamperCertificate=$null} }
+        (& $collectorScript -ServiceName Fixture -CheckAuthenticode).Authenticode.Status | Should Be HashMismatch
+    }
+    It 'records an unavailable signature check without leaking its exception' {
+        Mock Get-AuthenticodeSignature { throw 'Dummy sensitive exception contents' }
+        $snapshot = & $collectorScript -ServiceName Fixture -CheckAuthenticode
+        $snapshot.Authenticode.Status | Should Be Unavailable
+        ($snapshot.Notes -join ' ').Contains('Dummy sensitive') | Should Be $false
+    }
+    It 'does not report reliable mixed metadata while a component is open for writing' {
+        $path=Join-Path $TestDrive 'locked.exe'
+        [IO.File]::WriteAllText($path,'Fixture only')
+        $writer=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite)
+        try {
+            $snapshot = & $collectorScript -ServiceName Fixture -VersionFile $path
+            $snapshot.SelectionReliable | Should Be $false
+        } finally { $writer.Dispose() }
     }
 }

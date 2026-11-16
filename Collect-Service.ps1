@@ -1,8 +1,15 @@
 # Executed locally or through an existing, authorized PowerShell remoting connection.
-param([string]$ServiceName, [string]$VersionFile)
+param([string]$ServiceName, [string]$VersionFile, [switch]$CheckAuthenticode)
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $notes = New-Object 'System.Collections.Generic.List[string]'
+$computerIdentity = $null
+try {
+    $identityValue = [string](Get-ItemProperty -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid
+    $identityGuid = [guid]::Empty
+    if ([guid]::TryParse($identityValue,[ref]$identityGuid) -and $identityGuid -ne [guid]::Empty) { $computerIdentity = $identityGuid.ToString() }
+} catch { }
+if (-not $computerIdentity) { $notes.Add('The Windows machine identity could not be read. Cross-capture device identity requires review.') }
 
 function Resolve-ServiceFile([string]$CommandLine) {
     if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $null }
@@ -75,13 +82,21 @@ $hash = $null
 $modified = $null
 $product = $null
 $company = $null
+$authenticode = [pscustomobject][ordered]@{
+    Status='NotChecked';SignerSubject=$null;SignerThumbprint=$null;Publisher=$null;Issuer=$null
+    NotBeforeUtc=$null;NotAfterUtc=$null;CertificateTimeValid=$null;TimestampSignerSubject=$null
+}
 if ($versionPath) {
+    $fileStream = $null
     try {
         if (-not [IO.Path]::IsPathRooted($versionPath)) { throw 'The component path is not absolute.' }
         if ($versionPath.StartsWith('\\')) { throw 'Use a file on the target computer, not a UNC path.' }
         $file = Get-Item -LiteralPath $versionPath -ErrorAction Stop
         if ($file.PSIsContainer) { throw 'The component path is a directory.' }
         $versionPath = $file.FullName
+        # Deny concurrent writes/deletes while reading metadata, hash, and signature.
+        # A file already open for writing produces an unreliable capture instead of mixed evidence.
+        $fileStream = [IO.File]::Open($file.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
         $lengthBefore = $file.Length
         $modifiedBefore = $file.LastWriteTimeUtc
         $metadata = [Diagnostics.FileVersionInfo]::GetVersionInfo($file.FullName)
@@ -91,6 +106,23 @@ if ($versionPath) {
         $company = [string]$metadata.CompanyName
         $modified = $file.LastWriteTimeUtc.ToString('o')
         $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+        if ($CheckAuthenticode) {
+            try {
+                $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName -ErrorAction Stop
+                $authenticode.Status = [string]$signature.Status
+                $certificate = $signature.SignerCertificate
+                if ($null -ne $certificate) {
+                    $authenticode.SignerSubject = $certificate.Subject
+                    $authenticode.SignerThumbprint = $certificate.Thumbprint
+                    $authenticode.Publisher = $certificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName,$false)
+                    $authenticode.Issuer = $certificate.Issuer
+                    $authenticode.NotBeforeUtc = $certificate.NotBefore.ToUniversalTime().ToString('o')
+                    $authenticode.NotAfterUtc = $certificate.NotAfter.ToUniversalTime().ToString('o')
+                    $authenticode.CertificateTimeValid = [DateTime]::UtcNow -ge $certificate.NotBefore.ToUniversalTime() -and [DateTime]::UtcNow -le $certificate.NotAfter.ToUniversalTime()
+                }
+                if ($null -ne $signature.TimeStamperCertificate) { $authenticode.TimestampSignerSubject = $signature.TimeStamperCertificate.Subject }
+            } catch { $authenticode.Status = 'Unavailable'; $notes.Add('Authenticode validation was unavailable. Check file access and certificate trust services.') }
+        }
         $file.Refresh()
         if ($file.Length -ne $lengthBefore -or $file.LastWriteTimeUtc -ne $modifiedBefore) {
             $selectionReliable = $false
@@ -99,7 +131,10 @@ if ($versionPath) {
         if (-not $productVersion -and -not $fileVersion) { $notes.Add('The selected file does not publish product or file version metadata.') }
     } catch {
         $selectionReliable = $false
-        $notes.Add(('Could not inspect the component: {0}' -f $_.Exception.Message))
+        if ($versionPath.StartsWith('\\')) { $notes.Add('UNC component paths are not supported.') }
+        else { $notes.Add('Could not inspect the component. Check the absolute local path, read permissions, and whether patching is still in progress.') }
+    } finally {
+        if ($null -ne $fileStream) { $fileStream.Dispose() }
     }
 } else {
     $selectionReliable = $false
@@ -118,6 +153,7 @@ if ($null -eq $stateAtEnd -or $stateAtEnd.State -ne $service.State -or $stateAtE
     SchemaVersion = 1
     CapturedAtUtc = [DateTime]::UtcNow.ToString('o')
     ComputerName = $env:COMPUTERNAME
+    ComputerIdentity = $computerIdentity
     ServiceName = [string]$service.Name
     DisplayName = [string]$service.DisplayName
     State = [string]$service.State
@@ -135,4 +171,5 @@ if ($null -eq $stateAtEnd -or $stateAtEnd.State -ne $service.State -or $stateAtE
     FileModifiedAtUtc = $modified
     SelectionReliable = $selectionReliable
     Notes = @($notes.ToArray())
+    Authenticode = $authenticode
 }

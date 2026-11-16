@@ -1,34 +1,53 @@
 Set-StrictMode -Version 2.0
+. (Join-Path $PSScriptRoot 'EvidenceSecurity.ps1')
 
 function Get-PatchSnapshot {
-    [CmdletBinding()]
+    [CmdletBinding(DefaultParameterSetName='Computer')]
     param(
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ServiceName,
-        [string]$ComputerName = $env:COMPUTERNAME,
+        [Parameter(Mandatory,Position=0)][ValidateNotNullOrEmpty()][string]$ServiceName,
+        [Parameter(ParameterSetName='Computer')][string]$ComputerName = $env:COMPUTERNAME,
         [string]$VersionFile,
-        [System.Management.Automation.PSCredential]$Credential,
-        [switch]$UseSSL
+        [Parameter(ParameterSetName='Computer')][System.Management.Automation.PSCredential]$Credential,
+        [Parameter(ParameterSetName='Computer')][switch]$UseSSL,
+        [Parameter(ParameterSetName='Computer')][ValidateSet('Default','Kerberos','Negotiate')][string]$Authentication = 'Default',
+        [Parameter(ParameterSetName='Computer')][string]$ConfigurationName,
+        [Parameter(Mandatory,ParameterSetName='Session')][System.Management.Automation.Runspaces.PSSession]$Session,
+        [switch]$CheckAuthenticode
     )
     if ($ServiceName.Trim().Length -eq 0 -or $ServiceName.Length -gt 256) { throw 'Enter a service name of 1 to 256 characters.' }
     if ([string]::IsNullOrWhiteSpace($ComputerName)) { $ComputerName = $env:COMPUTERNAME }
     $ComputerName = $ComputerName.Trim()
     $collectorPath = Join-Path $PSScriptRoot 'Collect-Service.ps1'
-    if ($ComputerName -in @('.', 'localhost', $env:COMPUTERNAME) -and $null -eq $Credential -and -not $UseSSL) {
-        & $collectorPath -ServiceName $ServiceName.Trim() -VersionFile $VersionFile
+    if ($PSCmdlet.ParameterSetName -eq 'Computer' -and $ComputerName -in @('.', 'localhost', $env:COMPUTERNAME) -and $null -eq $Credential -and -not $UseSSL -and -not $ConfigurationName) {
+        & $collectorPath -ServiceName $ServiceName.Trim() -VersionFile $VersionFile -CheckAuthenticode:$CheckAuthenticode
     } else {
         # Only this bundled collector is executed. User entries remain arguments.
         $parsedAddress = $null
-        if ([Net.IPAddress]::TryParse($ComputerName,[ref]$parsedAddress) -and $null -eq $Credential) {
+        $isIp = [Net.IPAddress]::TryParse($ComputerName,[ref]$parsedAddress)
+        if ($PSCmdlet.ParameterSetName -eq 'Computer' -and $Authentication -eq 'Kerberos' -and $isIp) {
+            throw 'Kerberos requires a server DNS name, preferably its FQDN. An IP address is not accepted. No NTLM fallback was attempted.'
+        }
+        if ($PSCmdlet.ParameterSetName -eq 'Computer' -and $Authentication -eq 'Negotiate' -and -not $UseSSL) {
+            throw 'Explicit Negotiate mode requires HTTPS with certificate validation. Use Kerberos for HTTP, or deliberately select Default for an existing legacy WinRM policy.'
+        }
+        if ($PSCmdlet.ParameterSetName -eq 'Computer' -and $isIp -and $null -eq $Credential) {
             throw 'Connecting by IP address requires explicit credentials. Set remote credentials, or use the server name with your current Windows identity.'
         }
         $collector = [scriptblock]::Create([IO.File]::ReadAllText($collectorPath))
         $options = New-PSSessionOption -OpenTimeout 10000 -OperationTimeout 20000
-        $remoteArguments = @{
-            ComputerName=$ComputerName;ScriptBlock=$collector;ArgumentList=@($ServiceName.Trim(),$VersionFile)
-            SessionOption=$options;ErrorAction='Stop'
+        $collectorArguments = @($ServiceName.Trim(),$VersionFile)
+        if ($CheckAuthenticode) { $collectorArguments += $true }
+        $remoteArguments = @{ScriptBlock=$collector;ArgumentList=$collectorArguments;ErrorAction='Stop'}
+        if ($PSCmdlet.ParameterSetName -eq 'Session') { $remoteArguments.Session = $Session }
+        else {
+            $remoteArguments.ComputerName = $ComputerName
+            $remoteArguments.SessionOption = $options
+            if ($Authentication -ne 'Default') { $remoteArguments.Authentication = $Authentication }
+            if ($ConfigurationName) { $remoteArguments.ConfigurationName = $ConfigurationName }
+            if ($null -ne $Credential) { $remoteArguments.Credential = $Credential }
+            if ($UseSSL) { $remoteArguments.UseSSL = $true }
         }
-        if ($null -ne $Credential) { $remoteArguments.Credential = $Credential }
-        if ($UseSSL) { $remoteArguments.UseSSL = $true }
+        # One attempt only. Never retry with a weaker authentication mode or different account.
         Invoke-Command @remoteArguments
     }
 }
@@ -49,6 +68,30 @@ function Assert-PatchSnapshot {
         if ($null -ne $Snapshot.$name -and ($Snapshot.$name -isnot [string] -or $Snapshot.$name.Length -gt 8192)) { throw "Invalid snapshot field: $name." }
     }
     if ($Snapshot.SelectionReliable -isnot [bool]) { throw 'Invalid snapshot reliability flag.' }
+    $identity = Get-PatchProperty $Snapshot 'ComputerIdentity'
+    if ($identity -and ($identity -isnot [string] -or $identity -notmatch '^[a-fA-F0-9]{8}-(?:[a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}$')) { throw 'Invalid snapshot computer identity.' }
+    if ($Snapshot.FileSha256 -and $Snapshot.FileSha256 -notmatch '^[A-Fa-f0-9]{64}$') { throw 'Invalid snapshot SHA-256.' }
+    if ($Snapshot.Notes -is [string] -or $Snapshot.Notes -isnot [System.Collections.IEnumerable]) { throw 'Invalid snapshot notes collection.' }
+    $signature = Get-PatchProperty $Snapshot 'Authenticode'
+    if ($null -ne $signature) {
+        if ((Get-PatchProperty $signature 'Status') -notin @('NotChecked','Valid','UnknownError','NotSigned','HashMismatch','NotTrusted','NotSupportedFileFormat','Incompatible','Unavailable')) { throw 'Invalid Authenticode status.' }
+        foreach ($name in $script:signatureFields | Where-Object { $_ -ne 'CertificateTimeValid' }) {
+            $value = Get-PatchProperty $signature $name
+            if ($null -ne $value -and ($value -isnot [string] -or $value.Length -gt 8192)) { throw 'Invalid Authenticode certificate metadata.' }
+        }
+        $timeValid = Get-PatchProperty $signature 'CertificateTimeValid'
+        if ($null -ne $timeValid -and $timeValid -isnot [bool]) { throw 'Invalid certificate validity flag.' }
+        $certificateDates = @{}
+        foreach ($name in @('NotBeforeUtc','NotAfterUtc')) {
+            $value = Get-PatchProperty $signature $name
+            $date = [DateTimeOffset]::MinValue
+            if ($value) {
+                if (-not [DateTimeOffset]::TryParse($value,[ref]$date)) { throw 'Invalid Authenticode certificate date.' }
+                $certificateDates[$name] = $date
+            }
+        }
+        if ($certificateDates.ContainsKey('NotBeforeUtc') -and $certificateDates.ContainsKey('NotAfterUtc') -and $certificateDates.NotBeforeUtc -gt $certificateDates.NotAfterUtc) { throw 'Invalid Authenticode certificate validity interval.' }
+    }
     $parsedDate = [DateTimeOffset]::MinValue
     foreach ($name in @('CapturedAtUtc','ProcessStartedAtUtc','FileModifiedAtUtc')) {
         if ($Snapshot.$name -and -not [DateTimeOffset]::TryParse($Snapshot.$name, [ref]$parsedDate)) { throw "Invalid snapshot date: $name." }
@@ -87,7 +130,10 @@ function Compare-PatchSnapshot {
         [Parameter(Mandatory)]$After,
         [string]$ExpectedVersion,
         [ValidateSet('Auto','ProductVersion','FileVersion')][string]$VersionField = 'Auto',
-        [ValidateSet('Same as before','Running','Stopped','Paused')][string]$ExpectedState = 'Same as before'
+        [ValidateSet('Same as before','Running','Stopped','Paused')][string]$ExpectedState = 'Same as before',
+        [switch]$RequireSignedBaseline,
+        [switch]$RequireValidSignature,
+        [string]$ExpectedPublisher
     )
     Assert-PatchSnapshot $Before
     Assert-PatchSnapshot $After
@@ -101,6 +147,17 @@ function Compare-PatchSnapshot {
     function Add-Check([string]$Name, [string]$Result, [string]$Detail) {
         $checks.Add([pscustomobject]@{Check=$Name;Result=$Result;Detail=$Detail})
     }
+    $beforeIdentity = Get-PatchProperty $Before 'ComputerIdentity'
+    $afterIdentity = Get-PatchProperty $After 'ComputerIdentity'
+    if ($beforeIdentity -and $afterIdentity -and $beforeIdentity -ine $afterIdentity) { throw 'The snapshots identify different Windows machines despite matching computer names.' }
+    if (-not $beforeIdentity -or -not $afterIdentity) { Add-Check 'Computer identity' 'Review' 'The Windows machine identity is unavailable in one or both captures, including legacy snapshots.' }
+    $beforeIntegrity = Get-PatchEvidenceState $Before
+    $afterIntegrity = Get-PatchEvidenceState $After
+    foreach ($entry in @(@('Before',$beforeIntegrity),@('After',$afterIntegrity))) {
+        if ($entry[1] -eq 'Modified') { Add-Check ($entry[0] + ' evidence integrity') 'Fail' 'Loaded evidence was modified in memory after verification.' }
+        elseif ($entry[1] -notin @('InMemory','Verified')) { Add-Check ($entry[0] + ' evidence integrity') 'Review' ('Loaded evidence is unverified: ' + $entry[1]) }
+    }
+    if ($RequireSignedBaseline -and $beforeIntegrity -ne 'Verified') { Add-Check 'Baseline signature policy' 'Review' 'A baseline verified against the configured evidence signer list is required.' }
     $wantedState = if ($ExpectedState -eq 'Same as before') { $Before.State } else { $ExpectedState }
     if ($wantedState -notin @('Running','Stopped','Paused')) {
         Add-Check 'Service state' 'Review' 'The baseline captured a transitional state. Select a stable expected state.'
@@ -111,6 +168,38 @@ function Compare-PatchSnapshot {
     if ($Before.StartMode -ne $After.StartMode) { Add-Check 'Startup mode' 'Review' ("Changed from {0} to {1}." -f $Before.StartMode,$After.StartMode) }
     if ($Before.VersionPath -ine $After.VersionPath -or $Before.VersionSource -ne $After.VersionSource) {
         Add-Check 'Version source' 'Review' 'The selected component path or discovery method changed. Confirm that the files represent the same application.'
+    }
+    if (-not $Before.VersionPath -or -not $After.VersionPath -or -not $Before.ExecutablePath -or -not $After.ExecutablePath -or -not $Before.VersionSource -or -not $After.VersionSource) {
+        Add-Check 'Component identity' 'Review' 'The intended executable/component identity is incomplete.'
+    } elseif ($Before.ExecutablePath -ine $After.ExecutablePath) { Add-Check 'Component identity' 'Review' 'The service executable path changed. Confirm the intended application.' }
+    if (-not $Before.StartMode -or -not $After.StartMode -or -not $Before.FileModifiedAtUtc -or -not $After.FileModifiedAtUtc) {
+        Add-Check 'Required metadata' 'Review' 'Startup mode or component modification time is unavailable.'
+    }
+    if ($Before.FileSha256 -and $Before.FileSha256 -ieq $After.FileSha256 -and
+        ($Before.ProductVersion -cne $After.ProductVersion -or $Before.FileVersion -cne $After.FileVersion)) {
+        Add-Check 'Evidence consistency' 'Fail' 'Identical component SHA-256 hashes conflict with the reported embedded version metadata.'
+    }
+    foreach ($snapshot in @($Before,$After)) {
+        if ($snapshot.ProcessStartedAtUtc -and [DateTimeOffset]::Parse($snapshot.ProcessStartedAtUtc) -gt [DateTimeOffset]::Parse($snapshot.CapturedAtUtc)) {
+            Add-Check 'Evidence consistency' 'Review' 'A process start time is later than its capture time.'
+        }
+    }
+    if ($After.State -in @('Running','Paused') -and [long]$After.ProcessId -eq 0) { Add-Check 'Evidence consistency' 'Review' 'A running service has no process ID.' }
+    $authenticode = Get-PatchProperty $After 'Authenticode'
+    $signatureStatus = Get-PatchProperty $authenticode 'Status' 'NotChecked'
+    if ($signatureStatus -eq 'Valid' -and (
+        -not (Get-PatchProperty $authenticode 'SignerSubject') -or
+        (Get-PatchProperty $authenticode 'SignerThumbprint') -notmatch '^[A-Fa-f0-9]{40}$' -or
+        -not (Get-PatchProperty $authenticode 'Issuer') -or
+        -not (Get-PatchProperty $authenticode 'NotBeforeUtc') -or -not (Get-PatchProperty $authenticode 'NotAfterUtc'))) {
+        Add-Check 'Authenticode evidence' 'Review' 'A valid signature was reported without complete signer certificate evidence.'
+    }
+    if ($signatureStatus -eq 'HashMismatch') { Add-Check 'Authenticode' 'Fail' 'The executable signature does not match the file contents.' }
+    elseif ($signatureStatus -notin @('NotChecked','Valid')) { Add-Check 'Authenticode' 'Review' ('Executable signature status: ' + $signatureStatus + '. This alone does not classify the application as malicious.') }
+    if (($RequireValidSignature -or $ExpectedPublisher) -and $signatureStatus -ne 'Valid') {
+        Add-Check 'Publisher policy' 'Review' 'The publisher policy requires a valid Authenticode signature.'
+    } elseif ($ExpectedPublisher -and (Get-PatchProperty $authenticode 'SignerSubject') -ine $ExpectedPublisher.Trim()) {
+        Add-Check 'Publisher policy' 'Fail' 'The trusted executable signer subject does not match the expected publisher.'
     }
     if (-not $Before.SelectionReliable -or -not $After.SelectionReliable) {
         Add-Check 'Collection' 'Review' 'One or both snapshots could not reliably inspect the component. Review capture notes.'
@@ -175,7 +264,9 @@ function Compare-PatchSnapshot {
         DocumentType='PatchValidatorReport';SchemaVersion=1;CreatedAtUtc=[DateTime]::UtcNow.ToString('o')
         Verdict=$verdict;Summary=$summary;VersionField=$VersionField;ExpectedVersion=$ExpectedVersion
         ExpectedState=$wantedState;Checks=@($checks.ToArray());Before=$Before;After=$After
-        Scope='Installed component metadata and observed service/process state; not an application health test or proof of in-memory code version.'
+        RequireSignedBaseline=[bool]$RequireSignedBaseline;RequireValidSignature=[bool]$RequireValidSignature;ExpectedPublisher=$ExpectedPublisher
+        BaselineVerification=$beforeIntegrity;AfterVerification=$afterIntegrity
+        Scope='Installed component metadata and observed service/process state; not an application health test, proof of in-memory code version, or proof of CVE remediation.'
     }
 }
 
@@ -183,6 +274,7 @@ function Write-PatchJson {
     param($Value, [string]$Path)
     $fullPath = [IO.Path]::GetFullPath($Path)
     $json = $Value | ConvertTo-Json -Depth 12
+    if ([Text.Encoding]::UTF8.GetByteCount($json) -gt 4MB) { throw 'Evidence exceeds the 4 MiB size limit.' }
     $temporary = Join-Path ([IO.Path]::GetDirectoryName($fullPath)) ([IO.Path]::GetRandomFileName())
     try {
         [IO.File]::WriteAllText($temporary,$json,(New-Object Text.UTF8Encoding($false)))
@@ -193,35 +285,56 @@ function Write-PatchJson {
 
 function Save-PatchSnapshot {
     [CmdletBinding()]
-    param([Parameter(Mandatory)]$Snapshot,[Parameter(Mandatory)][string]$Path)
-    Assert-PatchSnapshot $Snapshot
-    Write-PatchJson -Value ([pscustomobject]@{DocumentType='PatchValidatorSnapshot';SchemaVersion=1;Snapshot=$Snapshot}) -Path $Path
+    param([Parameter(Mandatory)]$Snapshot,[Parameter(Mandatory)][string]$Path,
+        [Security.Cryptography.X509Certificates.X509Certificate2]$SigningCertificate,[switch]$RequireSignature)
+    if ($null -ne $SigningCertificate -and (Get-PatchEvidenceState $Snapshot) -notin @('InMemory','Verified')) {
+        throw 'Unverified or modified imported evidence cannot be re-signed as a trusted baseline. Capture a new baseline or verify the original signer.'
+    }
+    $document = [pscustomobject]@{DocumentType='PatchValidatorSnapshot';SchemaVersion=1;Snapshot=(ConvertTo-PatchSnapshotData $Snapshot)}
+    Write-PatchEvidence -Document $document -Path $Path -SigningCertificate $SigningCertificate -RequireSignature:$RequireSignature
 }
 
 function Read-PatchSnapshot {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path)
-    $file = Get-Item -LiteralPath $Path -ErrorAction Stop
-    if ($file.Length -gt 1MB) { throw 'Snapshot exceeds the 1 MiB size limit.' }
-    $jsonOptions = @{ErrorAction='Stop'}
-    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) { $jsonOptions.DateKind = 'String' }
-    $document = [IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json @jsonOptions
+    param([Parameter(Mandatory)][string]$Path,[string[]]$TrustedSignerThumbprint,[switch]$RequireSignature)
+    $evidence = Read-PatchEvidence -Path $Path -TrustedSignerThumbprint $TrustedSignerThumbprint -RequireSignature:$RequireSignature
+    $document = $evidence.Document
     if ($document.DocumentType -ne 'PatchValidatorSnapshot' -or $document.SchemaVersion -ne 1) { throw 'This is not a supported Patch Validator snapshot.' }
-    # PowerShell 6 through 7.4 automatically turn JSON timestamp strings into dates.
-    foreach ($name in @('CapturedAtUtc','ProcessStartedAtUtc','FileModifiedAtUtc')) {
-        if ($document.Snapshot.PSObject.Properties.Name -contains $name -and $document.Snapshot.$name -is [DateTime]) {
-            $document.Snapshot.$name = $document.Snapshot.$name.ToUniversalTime().ToString('o')
-        }
-    }
-    Assert-PatchSnapshot $document.Snapshot
-    return $document.Snapshot
+    $snapshot = ConvertFrom-PatchSnapshotData $document.Snapshot
+    Register-PatchEvidence $snapshot $evidence.Status $evidence.Signer
+    return $snapshot
 }
 
 function Save-PatchReport {
     [CmdletBinding()]
-    param([Parameter(Mandatory)]$Report,[Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)]$Report,[Parameter(Mandatory)][string]$Path,
+        [Security.Cryptography.X509Certificates.X509Certificate2]$SigningCertificate,[switch]$RequireSignature)
     if ($Report.DocumentType -ne 'PatchValidatorReport') { throw 'Invalid comparison report.' }
-    Write-PatchJson -Value $Report -Path $Path
+    # Recompute the verdict and whitelist fields. Do not serialize arbitrary caller properties.
+    $clean = Compare-PatchSnapshot -Before $Report.Before -After $Report.After -ExpectedVersion $Report.ExpectedVersion -VersionField $Report.VersionField -ExpectedState $Report.ExpectedState `
+        -RequireSignedBaseline:([bool](Get-PatchProperty $Report 'RequireSignedBaseline' $false)) `
+        -RequireValidSignature:([bool](Get-PatchProperty $Report 'RequireValidSignature' $false)) -ExpectedPublisher (Get-PatchProperty $Report 'ExpectedPublisher')
+    $clean.Before = ConvertTo-PatchSnapshotData $Report.Before
+    $clean.After = ConvertTo-PatchSnapshotData $Report.After
+    Write-PatchEvidence -Document $clean -Path $Path -SigningCertificate $SigningCertificate -RequireSignature:$RequireSignature
 }
 
-Export-ModuleMember -Function Get-PatchSnapshot,Compare-PatchSnapshot,Save-PatchSnapshot,Read-PatchSnapshot,Save-PatchReport
+function Read-PatchReport {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path,[string[]]$TrustedSignerThumbprint,[switch]$RequireSignature)
+    $evidence = Read-PatchEvidence -Path $Path -TrustedSignerThumbprint $TrustedSignerThumbprint -RequireSignature:$RequireSignature
+    $report = $evidence.Document
+    if ($report.DocumentType -ne 'PatchValidatorReport' -or $report.SchemaVersion -ne 1) { throw 'Invalid comparison report.' }
+    $report.Before = ConvertFrom-PatchSnapshotData $report.Before
+    $report.After = ConvertFrom-PatchSnapshotData $report.After
+    $report | Add-Member -NotePropertyName EvidenceVerification -NotePropertyValue $evidence.Status -Force
+    if ($evidence.Status -ne 'Verified') {
+        $report | Add-Member -NotePropertyName UnverifiedClaimedVerdict -NotePropertyValue $report.Verdict -Force
+        $report.Verdict = 'Review'
+        $report.Summary = 'Report integrity has not been authenticated against a trusted signer.'
+    }
+    return $report
+}
+
+. (Join-Path $PSScriptRoot 'Batch.ps1')
+Export-ModuleMember -Function Get-PatchSnapshot,Compare-PatchSnapshot,Save-PatchSnapshot,Read-PatchSnapshot,Save-PatchReport,Read-PatchReport,Get-PatchSigningCertificate,Get-PatchErrorMessage,Import-PatchHostCsv,Import-PatchServiceCsv,New-PatchBatchPlan,Get-PatchBatchCapture,Save-PatchBatchBaseline,Read-PatchBatchBaseline,Save-PatchBatchReport,Read-PatchBatchReport

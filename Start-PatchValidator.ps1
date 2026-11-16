@@ -1,6 +1,13 @@
 #requires -Version 5.1
 [CmdletBinding()]
-param([switch]$SmokeTest, [string]$PreviewPath)
+param(
+    [switch]$SmokeTest, [string]$PreviewPath,
+    [ValidateSet('Kerberos','Negotiate','Default')][string]$Authentication = 'Kerberos',
+    [string]$ConfigurationName,
+    [switch]$CheckAuthenticode, [switch]$RequireValidSignature, [string]$ExpectedPublisher,
+    [string]$SigningCertificateThumbprint, [string[]]$TrustedSignerThumbprint,
+    [switch]$RequireSignedEvidence
+)
 
 $ErrorActionPreference = 'Stop'
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'The desktop client requires Windows.' }
@@ -11,6 +18,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Import-Module (Join-Path $PSScriptRoot 'PatchValidator.psd1') -Force
 . (Join-Path $PSScriptRoot 'CredentialDialog.ps1')
+. (Join-Path $PSScriptRoot 'SecurityDialog.ps1')
 [Windows.Forms.Application]::EnableVisualStyles()
 
 $script:beforeSnapshot = $null
@@ -20,6 +28,13 @@ $script:task = $null
 $script:baselineSaved = $false
 $script:remoteCredential = $null
 $script:moduleFile = Join-Path $PSScriptRoot 'PatchValidator.psd1'
+$script:security = [pscustomobject]@{
+    Authentication=$Authentication;ConfigurationName=$ConfigurationName
+    CheckAuthenticode=[bool]($CheckAuthenticode -or $RequireValidSignature -or $ExpectedPublisher)
+    RequireValidSignature=[bool]$RequireValidSignature;ExpectedPublisher=$ExpectedPublisher
+    SigningCertificateThumbprint=$SigningCertificateThumbprint;TrustedSignerThumbprint=@($TrustedSignerThumbprint)
+    RequireSignedEvidence=[bool]$RequireSignedEvidence
+}
 
 function New-Label([string]$Text) {
     $label = New-Object Windows.Forms.Label
@@ -54,8 +69,8 @@ function Format-Value($Value) {
 
 $form = New-Object Windows.Forms.Form
 $form.Text = 'Patch Validator ' + (Get-Module PatchValidator).Version.ToString()
-$form.Size = New-Object Drawing.Size(1120,850)
-$form.MinimumSize = New-Object Drawing.Size(940,740)
+$form.Size = New-Object Drawing.Size(1120,894)
+$form.MinimumSize = New-Object Drawing.Size(940,784)
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object Drawing.Font('Segoe UI',10)
 $form.BackColor = [Drawing.Color]::FromArgb(245,247,250)
@@ -66,7 +81,7 @@ $layout.Dock = 'Fill'
 $layout.Padding = New-Object Windows.Forms.Padding(20)
 $layout.ColumnCount = 1
 $layout.RowCount = 7
-foreach ($height in @(62,197,46,65)) {
+foreach ($height in @(62,273,46,65)) {
     [void]$layout.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Absolute,$height)))
 }
 [void]$layout.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Percent,56)))
@@ -85,12 +100,21 @@ $subtitle.Anchor = 'Top,Left'
 $subtitle.Location = New-Object Drawing.Point(2,40)
 $subtitle.ForeColor = [Drawing.Color]::FromArgb(80,94,112)
 $header.Controls.AddRange(@($title,$subtitle))
+$batchButton = New-Button 'Multiple hosts / services...'
+$batchButton.Dock = 'Right'
+$header.Controls.Add($batchButton)
+$batchButton.Add_Click({
+    try { & (Join-Path $PSScriptRoot 'Start-BatchValidator.ps1') -Security $script:security -Owner $form }
+    catch { Show-Problem (Get-PatchErrorMessage $_) }
+})
 $layout.Controls.Add($header,0,0)
 
 $settings = New-Object Windows.Forms.TableLayoutPanel
 $settings.Dock = 'Fill'
 $settings.ColumnCount = 4
-$settings.RowCount = 5
+$settings.RowCount = 6
+for ($row = 0; $row -lt 5; $row++) { [void]$settings.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize'))) }
+[void]$settings.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent',100)))
 foreach ($spec in @(@('Absolute',145),@('Percent',50),@('Absolute',148),@('Percent',50))) {
     [void]$settings.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle([Windows.Forms.SizeType]::$($spec[0]),$spec[1])))
 }
@@ -140,11 +164,25 @@ $credentialPanel.Controls.AddRange(@($credentialButton,$clearCredentialButton,$s
 $settings.Controls.Add((New-Label 'Remote account'),0,3)
 $settings.Controls.Add($credentialPanel,1,3)
 $settings.SetColumnSpan($credentialPanel,3)
-$hint = New-Label 'Enter a service name to discover its version. An IP connection needs credentials and HTTPS or an existing WinRM TrustedHosts entry.'
+$securityPanel = New-Object Windows.Forms.FlowLayoutPanel
+$securityPanel.Dock = 'Fill'
+$securityPanel.AutoSize = $true
+$securityPanel.WrapContents = $false
+$securityButton = New-Button 'Security settings...'
+$securityLabel = New-Label ''
+$securityLabel.AutoSize = $false
+$securityLabel.Width = 620
+$securityLabel.Height = 30
+$securityLabel.AutoEllipsis = $true
+$securityPanel.Controls.AddRange(@($securityButton,$securityLabel))
+$settings.Controls.Add((New-Label 'Security policy'),0,4)
+$settings.Controls.Add($securityPanel,1,4)
+$settings.SetColumnSpan($securityPanel,3)
+$hint = New-Label 'Use a server FQDN with Kerberos. For IP/local-account connections, select Negotiate in Security settings, credentials, and HTTPS.'
 $hint.ForeColor = [Drawing.Color]::FromArgb(80,94,112)
 $hint.AutoSize = $false
 $hint.Dock = 'Fill'
-$settings.Controls.Add($hint,0,4)
+$settings.Controls.Add($hint,0,5)
 $settings.SetColumnSpan($hint,4)
 $layout.Controls.Add($settings,0,1)
 
@@ -223,6 +261,8 @@ $tooltips.SetToolTip($sslChoice,'Use the existing WinRM HTTPS listener on port 5
 
 function Update-Buttons {
     $busy = $null -ne $script:task
+    $batchButton.Enabled = -not $busy
+    $securityButton.Enabled = -not $busy -and $null -eq $script:beforeSnapshot
     foreach ($control in @($computerBox,$serviceBox,$componentBox)) { $control.Enabled = -not $busy -and $null -eq $script:beforeSnapshot }
     foreach ($control in @($targetBox,$versionChoice,$stateChoice,$loadButton,$resetButton,$credentialButton,$sslChoice)) { $control.Enabled = -not $busy }
     $clearCredentialButton.Enabled = -not $busy -and $null -ne $script:remoteCredential
@@ -231,6 +271,23 @@ function Update-Buttons {
     $afterButton.Enabled = -not $busy -and $null -ne $script:beforeSnapshot
     $reportButton.Enabled = -not $busy -and $null -ne $script:comparison
 }
+
+function Update-SecuritySummary {
+    $evidenceMode = if ($script:security.RequireSignedEvidence) { 'signed evidence required' } else { 'unsigned evidence allowed (unverified)' }
+    $script:securityLabel.Text = $script:security.Authentication + '; ' + $evidenceMode
+    $tooltips.SetToolTip($securityLabel,'Configure security before capture/loading. Settings are locked until New comparison. Default authentication may use NTLM; Kerberos never falls back.')
+}
+function Get-GuiSigningCertificate {
+    if ($script:security.SigningCertificateThumbprint) { return Get-PatchSigningCertificate -Thumbprint $script:security.SigningCertificateThumbprint }
+    return $null
+}
+$securityButton.Add_Click({
+    try {
+        $settingsResult = Show-PatchSecurityDialog -Owner $form -Settings $script:security
+        if ($null -ne $settingsResult) { $script:security = $settingsResult; Update-SecuritySummary }
+    } catch { Show-Problem (Get-PatchErrorMessage $_) }
+})
+Update-SecuritySummary
 
 function Clear-RemoteCredential {
     if ($null -ne $script:remoteCredential) { $script:remoteCredential.Password.Dispose() }
@@ -252,7 +309,8 @@ $credentialButton.Add_Click({
             $statusLabel.Text = 'Remote credentials set for this session. Click Capture before or Capture after to connect.'
             Update-Buttons
         }
-    } catch { Show-Problem $_.Exception.Message }
+    } catch { Show-Problem (Get-PatchErrorMessage $_) }
+    finally { $enteredCredential = $null }
 })
 $clearCredentialButton.Add_Click({ Clear-RemoteCredential; $statusLabel.Text = 'Remote credentials cleared. Checks will use your current Windows identity.' })
 $computerBox.Add_TextChanged({ Clear-RemoteCredential })
@@ -263,7 +321,7 @@ function Update-Results {
         ComputerName='Computer';ServiceName='Service';DisplayName='Display name';CapturedAtUtc='Captured (UTC)'
         State='Service state';StartMode='Startup mode';ProductName='Product';ProductVersion='Product version'
         FileVersion='File version';VersionSource='Version source';VersionPath='Component file'
-        ProcessId='Process ID';ProcessStartedAtUtc='Process started (UTC)';FileSha256='SHA-256';Notes='Capture notes'
+        ProcessId='Process ID';ProcessStartedAtUtc='Process started (UTC)';FileSha256='SHA-256';ComputerIdentity='Windows machine identity';Notes='Capture notes'
     }
     foreach ($field in $fields.Keys) {
         $beforeValue = if ($script:beforeSnapshot) { Format-Value $script:beforeSnapshot.$field } else { '-' }
@@ -274,11 +332,19 @@ function Update-Results {
         }
         [void]$snapshotGrid.Rows.Add($fields[$field],$beforeValue,$afterValue)
     }
+    foreach ($signatureField in @('Status','SignerSubject','SignerThumbprint','Publisher','Issuer','NotBeforeUtc','NotAfterUtc','CertificateTimeValid','TimestampSignerSubject')) {
+        $beforeValue = if ($script:beforeSnapshot -and $script:beforeSnapshot.PSObject.Properties.Name -contains 'Authenticode') { Format-Value $script:beforeSnapshot.Authenticode.$signatureField } else { 'Not checked' }
+        $afterValue = if ($script:afterSnapshot -and $script:afterSnapshot.PSObject.Properties.Name -contains 'Authenticode') { Format-Value $script:afterSnapshot.Authenticode.$signatureField } else { 'Not checked' }
+        [void]$snapshotGrid.Rows.Add(('Authenticode: ' + $signatureField),$beforeValue,$afterValue)
+    }
+    $baselineIntegrity = if ($script:beforeSnapshot -and $script:beforeSnapshot.PSObject.Properties.Name -contains 'EvidenceVerification') { $script:beforeSnapshot.EvidenceVerification } else { 'In-memory capture; not authenticated as saved evidence' }
+    [void]$snapshotGrid.Rows.Add('Baseline integrity',$baselineIntegrity,'')
     $checksGrid.Rows.Clear()
     $script:comparison = $null
     if ($script:beforeSnapshot -and $script:afterSnapshot) {
         $script:comparison = Compare-PatchSnapshot -Before $script:beforeSnapshot -After $script:afterSnapshot `
-            -ExpectedVersion $targetBox.Text -VersionField ([string]$versionChoice.SelectedItem) -ExpectedState ([string]$stateChoice.SelectedItem)
+            -ExpectedVersion $targetBox.Text -VersionField ([string]$versionChoice.SelectedItem) -ExpectedState ([string]$stateChoice.SelectedItem) `
+            -RequireSignedBaseline:$script:security.RequireSignedEvidence -RequireValidSignature:$script:security.RequireValidSignature -ExpectedPublisher $script:security.ExpectedPublisher
         $resultLabel.Text = $script:comparison.Verdict.ToUpperInvariant() + ' - ' + $script:comparison.Summary
         $resultDetail.Text = 'Comparing ' + $script:comparison.VersionField + '. Export the report to preserve snapshots and validation results.'
         $resultPanel.BackColor = switch ($script:comparison.Verdict) {
@@ -308,18 +374,18 @@ function Start-Capture([string]$Stage) {
     if ($null -ne $script:task) { return }
     $worker = [PowerShell]::Create()
     [void]$worker.AddScript({
-        param($ModuleFile,$ServiceName,$ComputerName,$VersionFile,$Credential,$UseSSL)
+        param($ModuleFile,$ServiceName,$ComputerName,$VersionFile,$Credential,$UseSSL,$Authentication,$ConfigurationName,$CheckAuthenticode)
         $ErrorActionPreference = 'Stop'
         Import-Module $ModuleFile -Force
-        Get-PatchSnapshot -ServiceName $ServiceName -ComputerName $ComputerName -VersionFile $VersionFile -Credential $Credential -UseSSL:$UseSSL
-    }).AddArgument($script:moduleFile).AddArgument($serviceBox.Text).AddArgument($computerBox.Text).AddArgument($componentBox.Text).AddArgument($script:remoteCredential).AddArgument($sslChoice.Checked)
+        Get-PatchSnapshot -ServiceName $ServiceName -ComputerName $ComputerName -VersionFile $VersionFile -Credential $Credential -UseSSL:$UseSSL -Authentication $Authentication -ConfigurationName $ConfigurationName -CheckAuthenticode:$CheckAuthenticode
+    }).AddArgument($script:moduleFile).AddArgument($serviceBox.Text).AddArgument($computerBox.Text).AddArgument($componentBox.Text).AddArgument($script:remoteCredential).AddArgument($sslChoice.Checked).AddArgument($script:security.Authentication).AddArgument($script:security.ConfigurationName).AddArgument($script:security.CheckAuthenticode)
     try {
         if ($Stage -eq 'After') { $script:afterSnapshot = $null; $script:comparison = $null; Update-Results }
         $handle = $worker.BeginInvoke()
         $script:task = [pscustomobject]@{Worker=$worker;Handle=$handle;Stage=$Stage;Started=[DateTime]::UtcNow;Cancelling=$false}
         $statusLabel.Text = 'Reading service status and component metadata...'
         Update-Buttons
-    } catch { $worker.Dispose(); Show-Problem $_.Exception.Message }
+    } catch { $worker.Dispose(); Show-Problem (Get-PatchErrorMessage $_) }
 }
 
 $beforeButton.Add_Click({ Start-Capture 'Before' })
@@ -330,12 +396,14 @@ $saveButton.Add_Click({
     $dialog.FileName = 'patch-baseline.json'
     try {
         if ($dialog.ShowDialog($form) -eq 'OK') {
-            Save-PatchSnapshot -Snapshot $script:beforeSnapshot -Path $dialog.FileName
+            $certificate = Get-GuiSigningCertificate
+            Save-PatchSnapshot -Snapshot $script:beforeSnapshot -Path $dialog.FileName -SigningCertificate $certificate -RequireSignature:$script:security.RequireSignedEvidence
+            $script:beforeSnapshot = Read-PatchSnapshot -Path $dialog.FileName -TrustedSignerThumbprint $script:security.TrustedSignerThumbprint -RequireSignature:$script:security.RequireSignedEvidence
             $script:baselineSaved = $true
             $statusLabel.Text = 'Baseline saved: ' + $dialog.FileName
             Update-Results
         }
-    } catch { Show-Problem $_.Exception.Message } finally { $dialog.Dispose() }
+    } catch { Show-Problem (Get-PatchErrorMessage $_) } finally { $dialog.Dispose() }
 })
 $loadButton.Add_Click({
     if ($script:beforeSnapshot -and -not $script:baselineSaved) {
@@ -345,7 +413,7 @@ $loadButton.Add_Click({
     $dialog.Filter = 'Patch Validator snapshot (*.json)|*.json'
     try {
         if ($dialog.ShowDialog($form) -eq 'OK') {
-            $loaded = Read-PatchSnapshot -Path $dialog.FileName
+            $loaded = Read-PatchSnapshot -Path $dialog.FileName -TrustedSignerThumbprint $script:security.TrustedSignerThumbprint -RequireSignature:$script:security.RequireSignedEvidence
             $script:beforeSnapshot = $loaded
             $script:afterSnapshot = $null
             $script:baselineSaved = $true
@@ -355,7 +423,7 @@ $loadButton.Add_Click({
             $statusLabel.Text = 'Loaded baseline: ' + $dialog.FileName
             Update-Results
         }
-    } catch { Show-Problem $_.Exception.Message } finally { $dialog.Dispose() }
+    } catch { Show-Problem (Get-PatchErrorMessage $_) } finally { $dialog.Dispose() }
 })
 $reportButton.Add_Click({
     $dialog = New-Object Windows.Forms.SaveFileDialog
@@ -363,10 +431,10 @@ $reportButton.Add_Click({
     $dialog.FileName = 'patch-report.json'
     try {
         if ($dialog.ShowDialog($form) -eq 'OK') {
-            Save-PatchReport -Report $script:comparison -Path $dialog.FileName
+            Save-PatchReport -Report $script:comparison -Path $dialog.FileName -SigningCertificate (Get-GuiSigningCertificate) -RequireSignature:$script:security.RequireSignedEvidence
             $statusLabel.Text = 'Report exported: ' + $dialog.FileName
         }
-    } catch { Show-Problem $_.Exception.Message } finally { $dialog.Dispose() }
+    } catch { Show-Problem (Get-PatchErrorMessage $_) } finally { $dialog.Dispose() }
 })
 $resetButton.Add_Click({
     if ($script:beforeSnapshot -and -not $script:baselineSaved) {
@@ -380,8 +448,8 @@ $resetButton.Add_Click({
     $statusLabel.Text = 'Ready for a new comparison.'
     Update-Results
 })
-foreach ($box in @($targetBox)) { $box.Add_TextChanged({ try { Update-Results } catch { Show-Problem $_.Exception.Message } }) }
-foreach ($choice in @($versionChoice,$stateChoice)) { $choice.Add_SelectedIndexChanged({ try { Update-Results } catch { Show-Problem $_.Exception.Message } }) }
+foreach ($box in @($targetBox)) { $box.Add_TextChanged({ try { Update-Results } catch { Show-Problem (Get-PatchErrorMessage $_) } }) }
+foreach ($choice in @($versionChoice,$stateChoice)) { $choice.Add_SelectedIndexChanged({ try { Update-Results } catch { Show-Problem (Get-PatchErrorMessage $_) } }) }
 
 $timer = New-Object Windows.Forms.Timer
 $timer.Interval = 150
@@ -417,7 +485,7 @@ $timer.Add_Tick({
         if ($completed.Stage -eq 'After') { $script:afterSnapshot = $null; $script:comparison = $null }
         Update-Results
         $statusLabel.Text = 'Capture failed. Check the service/computer name and read permissions.'
-        Show-Problem $_.Exception.Message
+        Show-Problem (Get-PatchErrorMessage $_)
     } finally { $completed.Worker.Dispose(); Update-Buttons }
 })
 $form.Add_FormClosing({
@@ -436,7 +504,9 @@ try {
         # Instantiate and lay out real widgets without inspecting or modifying a service.
         $form.CreateControl()
         $form.PerformLayout()
-        if ($snapshotGrid.Rows.Count -ne 15 -or $beforeButton.Enabled -ne $true -or $afterButton.Enabled -ne $false) { throw 'GUI initialization failed.' }
+        if ($snapshotGrid.Rows.Count -ne 26 -or $beforeButton.Enabled -ne $true -or $afterButton.Enabled -ne $false) { throw 'GUI initialization failed.' }
+        if (-not $securityButton.Enabled -or $securityLabel.Text -notmatch $script:security.Authentication) { throw 'GUI security settings were not initialized.' }
+        if (-not $batchButton.Enabled -or $batchButton.Right -gt $header.ClientSize.Width) { throw 'Batch launcher is unavailable or outside the header.' }
         if ($versionChoice.SelectedItem -ne 'Auto' -or $stateChoice.SelectedItem -ne 'Same as before') { throw 'GUI comparison defaults were not set.' }
         if (-not $credentialButton.Enabled -or $clearCredentialButton.Enabled -or $sslChoice.Checked) { throw 'GUI credential defaults were not set.' }
         $smokePassword = ConvertTo-SecureString 'Dummy GUI smoke test password' -AsPlainText -Force
@@ -445,7 +515,7 @@ try {
         if (-not $clearCredentialButton.Enabled) { throw 'GUI credential clearing is unavailable.' }
         $script:task = [pscustomobject]@{SmokeTest=$true}
         Update-Buttons
-        if ($credentialButton.Enabled -or $clearCredentialButton.Enabled -or $sslChoice.Enabled) { throw 'Credentials can change during a capture.' }
+        if ($credentialButton.Enabled -or $clearCredentialButton.Enabled -or $sslChoice.Enabled -or $securityButton.Enabled) { throw 'Security settings can change during a capture.' }
         $script:task = $null
         $computerBox.Text = 'example.invalid'
         if ($null -ne $script:remoteCredential -or $clearCredentialButton.Enabled) { throw 'Credentials were retained when switching computers.' }

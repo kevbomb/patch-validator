@@ -78,12 +78,19 @@ function Read-PatchCredentialDialog {
         throw 'Enter both a username and password. The existing credentials have not been changed.'
     }
     $securePassword = New-Object Security.SecureString
+    $characters = $null
     try {
-        foreach ($character in $Prompt.Password.Text.ToCharArray()) { $securePassword.AppendChar($character) }
+        $characters = $Prompt.Password.Text.ToCharArray()
+        foreach ($character in $characters) { $securePassword.AppendChar($character) }
         $securePassword.MakeReadOnly()
         return New-Object Management.Automation.PSCredential($Prompt.UserName.Text.Trim(),$securePassword)
     } catch { $securePassword.Dispose(); throw }
-    finally { $Prompt.Password.Clear() }
+    finally {
+        if ($null -ne $characters) { [Array]::Clear($characters,0,$characters.Length) }
+        $characters = $null
+        $character = [char]0
+        $Prompt.Password.Clear()
+    }
 }
 
 function Show-PatchCredentialDialog {

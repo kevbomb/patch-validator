@@ -14,6 +14,7 @@ function New-TestSnapshot {
     param([hashtable]$Changes = @{})
     $values = [ordered]@{
         SchemaVersion=1;CapturedAtUtc='2026-01-01T10:00:00Z';ComputerName='SERVER1'
+        ComputerIdentity='11111111-1111-1111-1111-111111111111'
         ServiceName='ExampleService';DisplayName='Example service';State='Running';StartMode='Auto'
         ProcessId=100;ProcessStartedAtUtc='2026-01-01T09:00:00Z';ExecutablePath='C:\App\service.exe'
         VersionPath='C:\App\service.exe';VersionSource='Service executable';ProductName='Example';CompanyName='Example'
@@ -139,7 +140,8 @@ Describe 'Snapshot persistence' {
         $loaded.SelectionReliable | Should Be $true
         $loaded.CapturedAtUtc | Should Be '2026-01-01T10:00:00Z'
         ($loaded.CapturedAtUtc -is [string]) | Should Be $true
-        (Compare-PatchSnapshot $loaded (New-TestAfter) -ExpectedVersion '1.1').Verdict | Should Be 'Pass'
+        $loaded.EvidenceVerification | Should Be 'Unsigned'
+        (Compare-PatchSnapshot $loaded (New-TestAfter) -ExpectedVersion '1.1').Verdict | Should Be 'Review'
     }
     It 'replaces an existing snapshot without leaving a temporary file' {
         $path = Join-Path $TestDrive 'replace.json'
