@@ -4,7 +4,7 @@ A PowerShell desktop app that captures a Windows service before and after patchi
 
 ## Start the GUI
 
-Requires Windows with a desktop session and Windows PowerShell 5.1, or PowerShell 7 on Windows. The app uses built-in Windows Forms and CIM commands; no Python or third-party runtime modules are required.
+Requires Windows with a desktop session and Windows PowerShell 5.1, or PowerShell 7 on Windows. The app uses built-in Windows Forms and CIM commands; no third-party runtime modules are required.
 
 From this directory:
 
