@@ -2,5 +2,10 @@
 *.report.json
 patch-baseline.json
 patch-report.json
+batch-baseline.json
+batch-report.json
 TestResults.xml
 preview*.png
+# Local operational inputs; publish only the generic templates under examples/.
+/Host List/
+/Service List/
